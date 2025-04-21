@@ -1,0 +1,218 @@
+﻿struct kelField 
+{
+    float3 Ua;
+    float3 Ub;
+    float r;
+};
+
+struct brush
+{
+    float3 pos;
+    float eps;
+    float3 force;
+    float dt;
+};
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Deform
+
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWStructuredBuffer<float3> originalVertexBuffer;
+RWStructuredBuffer<float3> displacedVertexBuffer;
+
+// Calibration specific params
+float MinValue;
+float MaxValue;
+float MaxTime;
+
+// material specific params
+float alpha;
+float beta;
+
+// brushes
+StructuredBuffer<brush> brushes;
+
+static const float PI = 3.14159265f;
+
+float EvalA(kelField values)
+{
+    return values.Ua.x + 2.0f * values.Ub.x + values.r * values.Ub.y;
+}
+
+float EvalB(kelField values)
+{
+    if (values.r < MinValue)
+    {
+        return 0.0f;
+    }
+    return (values.Ua.y - values.Ub.y) / values.r;
+}
+
+float EvalDen(float r, float a)
+{
+    return 16.0f * PI * pow(a, 2) * pow(r, 3);
+}
+
+float EvalU0(float t, float a, float eps)
+{
+    float a2t2 = pow(a * t, 2);
+    float e2 = pow(eps, 2);
+    float ate = sqrt(a2t2 + e2);
+
+    float val0 = 2.0f / eps;
+    float val1 = 2.0f * e2 * e2 / pow(ate, 5);
+    float val2 = 16.0f * PI * pow(a, 2);
+    return (val0 - val1) / val2;
+}
+
+float EvalW(float r, float t, float a, float eps)
+{
+    // Eq. 12a in [de Goes and James 2018]
+    float r2 = pow(r, 2);
+    float e2 = pow(eps, 2);
+    float re = sqrt(r2 + e2);
+
+    float Rp = r + a * t;
+    float Rn = r - a * t;
+    float Rpe = sqrt(Rp * Rp + e2);
+    float Rne = sqrt(Rn * Rn + e2);
+
+    float val;
+    val = 2.0f * r2 * r / re;
+    val += -Rp * Rn * ((Rp / Rpe) + (Rn / Rne));
+    val += a * t * e2 * ((1.0f / Rpe) - (1.0f / Rne));
+
+    return val;
+}
+
+float EvalGradW(float r, float t, float a, float eps)
+{
+    // See Appendix C in [de Goes and James 2018]
+
+    float r2 = pow(r, 2);
+    float e2 = pow(eps, 2);
+
+    float re2 = r2 + e2;
+    float re = sqrt(re2);
+    float re3 = re * re2;
+
+    float Rp = r + a * t;
+    float Rpe2 = Rp * Rp + e2;
+    float Rpe = sqrt(Rpe2);
+    float Rpe3 = Rpe2 * Rpe;
+
+    float Rn = r + a * t;
+    float Rne2 = Rn * Rn + e2;
+    float Rne = sqrt(Rne2);
+    float Rne3 = Rne2 * Rne;
+
+    float val;
+    val =  2.0f * r2 * ((3.0f / re) - (r2 / re3));
+    val += -2.0f * r  * ((Rn / Rne) + (Rp / Rpe));
+    val += -e2   * r  * ((Rn / Rne3) + (Rp / Rpe3));
+
+    return val;
+}
+
+float EvalUStatic(float r, float a, float eps)
+{
+    float re = sqrt(r * r + eps * eps);
+    float val = 8.0f * PI * a * a;
+    return 1.0f / (val * re);
+}
+
+float EvalU(float r, float t, float a, float eps)
+{
+    // Eq. 8a in [de Goes and James 2018]
+    if (a >= MaxValue)
+    {
+        return 0.0f;
+    }
+    if (t >= MaxTime)
+    {
+        return EvalUStatic(r, a, eps);
+    }
+    if (r < MinValue)
+    {
+        return EvalU0(t, a, eps);
+    }
+
+    return EvalW(r, t, a, eps) / EvalDen(r, a);
+}
+
+float EvalGradUStatic(float r, float a, float eps)
+{
+    float re2 = r * r + eps * eps;
+    float re = sqrt(re2);
+    float val = 8.0f * PI * a * a;
+    return -r / (val * re2 * re);
+}
+
+float EvalGradU(float r, float t, float a, float eps)
+{
+    if (a >= MaxValue || r < MinValue)
+    {
+        return 0.0f;
+    }
+    if (t >= MaxTime)
+    {
+        return EvalGradUStatic(r, a, eps);
+    }
+
+    float f = EvalW(r, t, a, eps);
+    float g = EvalGradW(r, t, a, eps);
+    return (g - 3.0f * f / r) / EvalDen(r, a);
+}
+
+void Compute(float r, float t, float eps, out kelField values)
+{
+    kelField kel;
+    kel.Ua = float3(0, 0, 0);
+    kel.Ub = float3(0, 0, 0);
+
+    kel.r = r;
+    kel.Ua.x = EvalU(r, t, alpha, eps);
+    kel.Ua.y = EvalGradU(r, t, alpha, eps);
+
+    kel.Ub.x = EvalU(r, t, beta, eps);
+    kel.Ub.y = EvalGradU(r, t, beta, eps);
+    values = kel;
+}
+
+float3 CalibrateForce(float3 f, float eps)
+{
+    return f * (10.0f * beta * eps * eps);
+}
+
+float3 EvalDisp(float3 query, brush k)
+{
+    if (k.dt <= 0.f)
+    {
+        return float3(0, 0, 0);
+    }
+
+    float3 x = query - k.pos;
+    float r = length(x);
+
+    kelField values;
+    Compute(r, k.dt, k.eps, values);
+    float A = EvalA(values);
+    float B = EvalB(values);
+    return A * k.force + B * dot(k.force, x) * x;
+}
+
+[numthreads(128, 1, 1)]
+void Deform(uint3 id : SV_DispatchThreadID)
+{
+    float3 query = originalVertexBuffer[id.x];
+    brush kel = brushes[id.y];
+
+    float3 v0 = EvalDisp(query, kel);
+    float3 v1 = EvalDisp(query + 0.5f * v0, kel);
+    float3 v2 = EvalDisp(query + 0.5f * v1, kel);
+    float3 v3 = EvalDisp(query + v2, kel);
+
+    displacedVertexBuffer[id.x] += ((v0 + 2.0f * v1 + 2.0f * v2 + v3) / 6.0f);
+}

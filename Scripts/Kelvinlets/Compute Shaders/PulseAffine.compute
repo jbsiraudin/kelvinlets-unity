@@ -1,0 +1,215 @@
+﻿struct kelField 
+{
+    float3 Ua;
+    float3 Ub;
+    float r;
+};
+
+struct brush
+{
+    float3 pos;
+    float eps;
+    float3x3 force;
+    float dt;
+};
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Deform
+
+// Mesh buffers
+StructuredBuffer<float3> originalVertexBuffer;
+RWStructuredBuffer<float3> displacedVertexBuffer;
+
+// Calibration specific params
+float MinValue;
+float MaxValue;
+float MaxTime;
+
+// material specific params
+float alpha;
+float beta;
+
+// brushes
+StructuredBuffer<brush> brushes;
+
+static const float PI = 3.14159265f;
+
+float EvalA(kelField values)
+{
+    return values.Ua.x + 2.f * values.Ub.x + values.r * values.Ub.y;
+}
+
+float EvalB(kelField values)
+{
+    if (values.r < MinValue)
+    {
+        return 0.0f;
+    }
+    return (values.Ua.y - values.Ub.y) / values.r;
+}
+
+float EvalDen(float r, float a)
+{
+    return 16.0f * PI * a * pow(r, 3);
+}
+
+float EvalGradA(kelField values)
+{
+    // .Y gradient, .Z hessian
+    return values.Ua.y + 3.f * values.Ub.y + values.r * values.Ub.z;
+}
+
+float EvalGradB(kelField values)
+{
+    return (values.Ua.z - values.Ub.z - EvalB(values)) / values.r;
+}
+
+float EvalW(float r, float R, float eps)
+{
+    // Eq. 8b in [de Goes and James 2018]
+    float e2 = pow(eps, 2);
+    float R2 = R * R;
+    float Re2 = R2 + e2;
+    float Re = sqrt(Re2);
+
+    float num = e2 + 2.f * R2 - r * R * (3.f - R2 / Re2);
+    return num / Re;
+}
+
+float EvalGradW(float r, float R, float eps)
+{
+    // See Appendix C in [de Goes and James 2018]
+    float e2 = pow(eps, 2);
+    float R2 = R * R;
+    float Re2 = R2 + e2;
+    float Re = sqrt(Re2);
+
+    float num = -3.f * e2 * e2 * r;
+    float den = Re2 * Re2 * Re;
+    return num / den;
+}
+
+float EvalHessW(float r, float R, float eps)
+{
+    // See Appendix C in [de Goes and James 2018]
+    float e2 = pow(eps, 2);
+    float R2 = R * R;
+    float Re2 = R2 + e2;
+    float Re = sqrt(Re2);
+
+    float num = -3.f * e2 * e2 * (Re2 - 5.f * r * R);
+    float den = Re2 * Re2 * Re2 * Re;
+    return num / den;
+}
+
+float EvalGradU(float r, float t, float a, float eps)
+{
+    if (a >= MaxValue || t >= MaxTime || r < MinValue)
+    {
+        return 0.0f;
+    }
+
+    float fP = EvalW(r, r + a * t, eps);
+    float fN = EvalW(r, r - a * t, eps);
+    float gP = EvalGradW(r, r + a * t, eps);
+    float gN = EvalGradW(r, r - a * t, eps);
+    float Den = EvalDen(r, a);
+    return ((gP - gN) - 3.0f * (fP - fN) / r) / Den;
+}
+
+float EvalHessU(float r, float t, float a, float eps)
+{
+    if (a >= MaxValue || t >= MaxTime || r < MinValue)
+    {
+        return 0.f;
+    }
+
+    float r2 = r * r;
+    float fP = EvalW(r, r + a * t, eps);
+    float fN = EvalW(r, r - a * t, eps);
+    float gP = EvalGradW(r, r + a * t, eps);
+    float gN = EvalGradW(r, r - a * t, eps);
+    float hP = EvalHessW(r, r + a * t, eps);
+    float hN = EvalHessW(r, r - a * t, eps);
+    return ((hP - hN) - 6.f * (gP - gN) / r + 12.f * (fP - fN) / r2) / EvalDen(r, a);
+}
+
+void Compute(float r, float t, float eps, out kelField values)
+{
+    kelField kel;
+    kel.Ua = float3(0, 0, 0);
+    kel.Ub = float3(0, 0, 0);
+
+    kel.r = r;
+    kel.Ua.y = EvalGradU(r, t, alpha, eps);
+    kel.Ua.z = EvalHessU(r, t, alpha, eps);
+
+    kel.Ub.y = EvalGradU(r, t, beta, eps);
+    kel.Ub.z = EvalHessU(r, t, beta, eps);
+    values = kel;
+}
+
+float3 EvalDisp(float3 v, brush k)
+{
+    if (k.dt <= 0.0f)
+    {
+        return float3(0, 0, 0);
+    }
+
+    float3 x = v - k.pos;
+    float r = length(x);
+
+    kelField values;
+    Compute(r, k.dt, k.eps, values);
+
+    float3 Fx = mul(k.force, x);
+    float trace = k.force[0][0] + k.force[1][1] + k.force[2][2];
+    float3 TrTr = mul(transpose(k.force), x) + trace * x;
+
+    float3 result = float3(0, 0, 0);
+    result += EvalGradA(values) * (Fx / r);
+    result += EvalGradB(values) * dot(x, Fx) * (x / r);
+    result += EvalB(values) * TrTr;
+    return result;
+}
+
+float3x3 mat33FromMat44(float4x4 val)
+{
+    //float3x3 m;
+    //
+    //for (int i = 0; i < 3; i++)
+    //{
+    //    for (int j = 0; j < 3; j++)
+    //    {
+    //        m[i][j] = val[i][j];
+    //    }
+    //}
+
+    float3x3 m = float3x3(float3(10, 0, 0), float3(0, 10, 0), float3(0, 0, 10));
+    return m;
+}
+
+//void prepare(in brush2 k2, out brush k)
+//{
+//    k.pos = k2.pos;
+//    k.eps = k2.eps;
+//    k.force = mat33FromMat44(k2.force);
+//    k.dt = k2.dt;
+//}
+
+[numthreads(128, 1, 1)]
+void Deform(uint3 id : SV_DispatchThreadID)
+{
+    float3 query = originalVertexBuffer[id.x];
+    brush kel = brushes[id.y];
+    // kel.force = float3x3(float3(10, 0, 0), float3(0, 10, 0), float3(0, 0, 10));
+
+    float3 v0 = EvalDisp(query, kel);
+    float3 v1 = EvalDisp(query + 0.5f * v0, kel);
+    float3 v2 = EvalDisp(query + 0.5f * v1, kel);
+    float3 v3 = EvalDisp(query + v2, kel);
+
+    displacedVertexBuffer[id.x] += ((v0 + 2.0f * v1 + 2.0f * v2 + v3) / 6.0f);
+
+    // displacedVertexBuffer[id.x] += v0;
+}

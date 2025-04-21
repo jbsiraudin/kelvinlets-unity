@@ -1,0 +1,57 @@
+﻿struct brush
+{
+    float3 pos;
+    float eps;
+
+    float3 grab;
+    float scale;
+    float twist;
+};
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Deform
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWStructuredBuffer<float3> originalVertexBuffer;
+RWStructuredBuffer<float3> displacedVertexBuffer;
+
+// material specific params
+float alpha;
+float beta;
+
+// brushes
+StructuredBuffer<brush> brushes;
+
+float3 EvalDisp(float3 query, brush k)
+{
+    float3 x = query - k.pos;
+    float r = length(x);
+    float re2 = r * r + k.eps * k.eps;
+    float re = sqrt(re2);
+    float re3 = re2 * re;
+    float aff = (1.0 / re3 + 3.0 * k.eps * k.eps / (2.0 * re3 * re2));
+
+    float3 resultTranslate = ((alpha - beta) / re) * k.grab;
+    resultTranslate += (beta / re3) * dot(x, k.grab) * x;
+    resultTranslate += (alpha * k.eps * k.eps / (2 * re3)) * k.grab;
+
+    float3 resultScale = (2.0 * beta - alpha) * aff * (-k.scale) * x;
+    float3 resultTwist = (-alpha) * aff * cross((k.grab / length(k.grab)) * k.twist, x);
+
+    return (resultTranslate + resultScale + resultTwist);
+}
+
+[numthreads(128, 1, 1)]
+void Deform(uint3 id : SV_DispatchThreadID)
+{
+    float3 query = originalVertexBuffer[id.x];
+    brush kel = brushes[id.y];
+
+    float3 v0 = EvalDisp(query, kel);
+    float3 v1 = EvalDisp(query + 0.5f * v0, kel);
+    float3 v2 = EvalDisp(query + 0.5f * v1, kel);
+    float3 v3 = EvalDisp(query + v2, kel);
+
+    displacedVertexBuffer[id.x] += ((v0 + 2.0f * v1 + 2.0f * v2 + v3) / 6.0f);
+}

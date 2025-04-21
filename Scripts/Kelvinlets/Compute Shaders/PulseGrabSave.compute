@@ -1,0 +1,180 @@
+﻿struct kelField 
+{
+    float3 Ua;
+    float3 Ub;
+    float r;
+};
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel EvalDispRK4
+
+#include "UnityCG.cginc"
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+
+RWStructuredBuffer<float3> originalVertexBuffer;
+RWStructuredBuffer<float3> displacedVertexBuffer;
+
+CBUFFER_START(Params)
+
+    float mu;
+    float nu;
+    float eps;
+    float3 triggerPos;
+    float t;
+
+    float3 force;
+
+    float alpha;
+    float beta;
+
+    float MinValue;
+    float MaxValue;
+    float MaxTime;
+
+CBUFFER_END
+
+static const float PI = 3.14159265f;
+
+float EvalA(kelField values)
+{
+    return values.Ua.x + 2.f * values.Ub.x + values.r * values.Ub.y;
+}
+
+float EvalB(kelField values)
+{
+    if (values.r < MinValue)
+    {
+        return 0.f;
+    }
+    return (values.Ua.y - values.Ub.y) / values.r;
+}
+
+float EvalDen(float r, float a)
+{
+    return 16.f * PI * a * pow(r, 3);
+}
+
+float EvalU0(float t, float a)
+{
+    float a2t2 = pow(a * t, 2);
+    float e2 = pow(eps, 2);
+    float num = 5.f * t * e2 * e2;
+    float den = 8.f * PI * sqrt(pow(a2t2 + e2, 7));
+    return num / den;
+}
+
+float EvalW(float r, float R)
+{
+    // Eq. 8b in [de Goes and James 2018]
+
+    float e2 = pow(eps, 2);
+    float R2 = R * R;
+    float Re2 = R2 + e2;
+    float Re = sqrt(Re2);
+
+    float num = e2 + 2.f * R2 - r * R * (3.f - R2 / Re2);
+    return num / Re;
+}
+
+float EvalGradW(float r, float R)
+{
+    // See Appendix C in [de Goes and James 2018]
+
+    float e2 = pow(eps, 2);
+    float R2 = R * R;
+    float Re2 = R2 + e2;
+    float Re = sqrt(Re2);
+
+    float num = -3.f * e2 * e2 * r;
+    float den = Re2 * Re2 * Re;
+    return num / den;
+}
+
+float EvalU(float r, float t, float a)
+{
+    // Eq. 8a in [de Goes and James 2018]
+    if (a == MaxValue || t >= MaxTime)
+    {
+        return 0.f;
+    }
+    if (r < 0.1f)
+    {
+        return EvalU0(t, a);
+    }
+
+    float fP = EvalW(r, r + a * t);
+    float fN = EvalW(r, r - a * t);
+    float Den = EvalDen(r, a);
+    return (fP - fN) / Den;
+}
+
+float EvalGradU(float r, float t, float a)
+{
+    if (a == MaxValue || t >= MaxTime || r < MinValue)
+    {
+        return 0.f;
+    }
+
+    float fP = EvalW(r, r + a * t);
+    float fN = EvalW(r, r - a * t);
+    float gP = EvalGradW(r, r + a * t);
+    float gN = EvalGradW(r, r - a * t);
+    float Den = EvalDen(r, a);
+    return ((gP - gN) - 3.f * (fP - fN) / r) / Den;
+}
+
+void Compute(float r, float t, out kelField values)
+{
+    kelField kel;
+    kel.Ua = float3(0, 0, 0);
+    kel.Ub = float3(0, 0, 0);
+
+    kel.r = r;
+    kel.Ua.x = EvalU(r, t, alpha);
+    kel.Ua.y = EvalGradU(r, t, alpha);
+
+    kel.Ub.x = EvalU(r, t, beta);
+    kel.Ub.y = EvalGradU(r, t, beta);
+    values = kel;
+}
+
+float3 CalibrateForce()
+{
+    return force * (10.f * beta * eps * eps);
+}
+
+float3 EvalDisp(float3 query)
+{
+    if (t <= 0.f)
+    {
+        return float3(0, 0, 0);
+    }
+
+    float3 x = query - triggerPos;
+    float r = length(x);
+
+    kelField values;
+    Compute(r, t, values);
+    float A = EvalA(values);
+    float B = EvalB(values);
+    return A * force + B * dot(force, x) * x;
+}
+
+[numthreads(128, 1, 1)]
+void EvalDispRK4(uint3 id : SV_DispatchThreadID)
+{
+    float3 query = originalVertexBuffer[id.x];
+
+    float3 v0 = EvalDisp(query);
+    float3 v1 = EvalDisp(query + 0.5f * v0);
+    float3 v2 = EvalDisp(query + 0.5f * v1);
+    float3 v3 = EvalDisp(query + v2);
+
+    displacedVertexBuffer[id.x] = query + ((v0 + 2.0f * v1 + 2.0f * v2 + v3) / 6.0f);
+    
+    // displacedVertexBuffer[id.x] = query + v0;
+    // displacedVertexBuffer[id.x] = originalVertexBuffer[id.x];
+}
